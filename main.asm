@@ -1,3 +1,9 @@
+; lab3_full.asm
+; Архитектура: x86_64, ОС: Linux
+; Системные вызовы: syscall
+; Без библиотек, без mmap. Полное соответствие требованиям лабы.
+
+BITS 64
 GLOBAL _start
 
 SECTION .data
@@ -18,8 +24,8 @@ SECTION .bss
     fd           resq 1          ; 64-битный дескриптор
 
     buf_ptr      resq 1          ; начало буфера
-    buf_pos      resq 1          ; текущая позиция
-	buf_limit    resq 1          ; конец выделенной области
+    buf_pos      resq 1          ; текущая позиция записи
+    buf_limit    resq 1          ; конец выделенной области
 
     char_buf     resb 1
 
@@ -103,16 +109,23 @@ _start:
     mov [buf_limit], rax
     jmp .store_char
 
-    ; 6. Запись строки в файл
+    ; 6. Запись строки в файл (С ИНТЕГРИРОВАННОЙ ЛОГИКОЙ)
 .write_line:
-    ; <<< СЮДА БУДЕТ ВСТАВЛЕНА ЛОГИКА ВАРИАНТА №30 >>>
-    ; Пока просто копируем строку как есть
-
-    mov rsi, [buf_ptr]  ; адрес строки
+    ; rsi = начало строки, rdx = указатель на '\n'
+    mov rsi, [buf_ptr]
     mov rdx, [buf_pos]
-    sub rdx, rsi        ; длина
-    mov rax, 1          ; sys_write
+    call process_line   ; rax = указатель за последним символом результата
+
+    ; Гарантируем перевод строки
+    mov byte [rax], 10
+    inc rax
+
+    ; sys_write
     mov rdi, [fd]
+    mov rsi, [buf_ptr]
+    mov rdx, rax
+    sub rdx, rsi        ; длина результата + '\n'
+    mov rax, 1          ; sys_write
     syscall
     cmp rax, 0
     jl err_write_fail
@@ -129,11 +142,19 @@ _start:
     cmp rax, rcx
     je .close_file      ; буфер пуст -> сразу закрываем
 
-    sub rax, rcx        ; длина остатка
-    mov rdx, rax
-    mov rax, 1          ; sys_write
+    ; Обрабатываем остаток (последняя строка без \n)
+    mov rsi, [buf_ptr]
+    mov rdx, [buf_pos]
+    call process_line
+
+    mov byte [rax], 10
+    inc rax
+
     mov rdi, [fd]
     mov rsi, [buf_ptr]
+    mov rdx, rax
+    sub rdx, rsi
+    mov rax, 1          ; sys_write
     syscall
     cmp rax, 0
     jl err_write_fail
@@ -164,14 +185,12 @@ err_alloc_fail:
 
     ; --- Инициализация буфера ---
 init_buffer:
-    ; Получаем текущую границу кучи
     mov rax, 12         ; sys_brk
-    xor rdi, rdi        ; аргумент 0 = запрос текущего brk
+    xor rdi, rdi
     syscall
     cmp rax, -1
     je err_alloc_fail
 
-    ; Вычисляем новую границу (+4096)
     mov rdi, rax
     add rdi, 4096
     mov rax, 12
@@ -182,4 +201,80 @@ init_buffer:
     mov [buf_ptr], rdi
     mov [buf_pos], rdi
     mov [buf_limit], rax
+    ret
+
+    ; ----------------------------------------------------
+    ; ФУНКЦИЯ: process_line
+    ; Вход:  rsi = начало строки, rdx = указатель на '\n'
+    ; Выход: rax = указатель за последним записанным символом
+    ; Логика: Вариант №30 (in-place, O(N))
+    ; ----------------------------------------------------
+process_line:
+    push rbx                ; callee-saved по SysV ABI
+    mov rdi, rsi            ; rdi = write pointer (in-place)
+    xor ebx, ebx            ; bl = целевой символ (0 = не установлен)
+    xor r8b, r8b            ; r8b = флаг разделителя (0 = первое слово, 1 = нужен пробел)
+
+.next_char:
+    cmp rsi, rdx
+    je .finish
+
+    movzx eax, byte [rsi]
+    cmp eax, ' '
+    je .skip_sep
+    cmp eax, 9              ; Tab
+    je .skip_sep
+
+    ; Начало нового слова
+    cmp bl, 0
+    jne .check_match
+    mov bl, al              ; Запоминаем первый символ первого слова
+
+.check_match:
+    cmp al, bl
+    jne .skip_word          ; Не совпадает -> пропускаем слово
+
+    ; Совпадает! Вставляем пробел, если это не первое слово
+    cmp r8b, 0
+    je .no_sep
+    mov byte [rdi], ' '
+    inc rdi
+.no_sep:
+    mov r8b, 1              ; Следующие слова потребуют разделителя
+
+    ; Копируем слово целиком
+.copy_loop:
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    cmp rsi, rdx
+    je .finish
+    movzx eax, byte [rsi]
+    cmp eax, ' '
+    je .word_done
+    cmp eax, 9
+    je .word_done
+    jmp .copy_loop
+
+.word_done:
+    jmp .next_char
+
+.skip_word:
+    inc rsi
+    cmp rsi, rdx
+    je .finish
+    movzx eax, byte [rsi]
+    cmp eax, ' '
+    je .skip_sep
+    cmp eax, 9
+    je .skip_sep
+    jmp .skip_word
+
+.skip_sep:
+    inc rsi
+    jmp .next_char
+
+.finish:
+    mov rax, rdi            ; Возвращаем конец записанных данных
+    pop rbx
     ret
